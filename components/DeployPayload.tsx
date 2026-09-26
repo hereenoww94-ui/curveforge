@@ -6,8 +6,6 @@ import type { LaunchConfig } from "@/lib/dbc/formulas";
 
 interface Props {
   config: LaunchConfig;
-  /** Lets the studio adopt the SDK's derived threshold so both sides agree. */
-  onAdoptThreshold?: (threshold: number) => void;
 }
 
 type Result = {
@@ -15,7 +13,10 @@ type Result = {
   payload: unknown;
   simulatorThreshold: number;
   sdkThreshold: number | null;
+  /** Raw curve-cost vs SDK-derivation gap. Explains why we scale at all. */
   thresholdDeltaPct: number | null;
+  /** What the on-chain program will enforce, relative to what was requested. */
+  enforcementDeltaPct?: number | null;
   requestedThreshold?: number;
   converged?: boolean;
   rounds?: number;
@@ -57,7 +58,7 @@ function metric(label: string, value: string, sub?: string, tone?: string) {
   );
 }
 
-export default function DeployPayload({ config, onAdoptThreshold }: Props) {
+export default function DeployPayload({ config }: Props) {
   const [result, setResult] = useState<Result | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -101,7 +102,14 @@ export default function DeployPayload({ config, onAdoptThreshold }: Props) {
     }
   };
 
-  const converged = result?.converged ?? false;
+  const enforcementDeltaPct = result?.enforcementDeltaPct ?? null;
+  // What the program would have enforced had we built the curve to cost
+  // exactly the requested figure — the number the solver exists to avoid.
+  const curveCostGapPct = result?.thresholdDeltaPct ?? null;
+  const targetThreshold = result?.requestedThreshold ?? config.migrationQuoteThreshold;
+  const naiveEnforcement = curveCostGapPct === null ? null : targetThreshold * (1 + curveCostGapPct / 100);
+  /** SDK threshold as a percentage of the raw curve cost, i.e. the factor `c`. */
+  const sdkFactorPct = curveCostGapPct === null ? null : 100 + curveCostGapPct;
 
   return (
     <div className="panel" style={{ padding: 18, display: "grid", gap: 14 }}>
@@ -173,25 +181,29 @@ export default function DeployPayload({ config, onAdoptThreshold }: Props) {
             {metric(
               "Requested threshold",
               `${fmt(result.requestedThreshold ?? config.migrationQuoteThreshold)} ${config.quote}`,
-              "what the studio asked for",
+              "your graduation target",
               "#a78bfa",
             )}
             {metric(
-              "Converged threshold",
+              "Solved curve input",
               `${fmt(result.simulatorThreshold)} ${config.quote}`,
-              "fixed point both sides agree on",
+              "liquidity scale fed to the SDK",
               "#22d3ee",
             )}
             {metric(
-              "SDK confirms",
+              "Program enforces",
               `${fmt(result.sdkThreshold)} ${config.quote}`,
-              `${result.rounds ?? 1} round(s) of iteration`,
+              `${result.rounds ?? 1} round(s) — on-chain value`,
               "#34d399",
             )}
             {metric(
-              "Reconciliation delta",
-              `${result.thresholdDeltaPct !== null ? (result.thresholdDeltaPct >= 0 ? "+" : "") + result.thresholdDeltaPct.toExponential(1) : "—"}%`,
-              result.converged ? "fixed point reached" : "did not converge",
+              "Enforcement delta",
+              `${
+                enforcementDeltaPct !== null
+                  ? (enforcementDeltaPct >= 0 ? "+" : "") + enforcementDeltaPct.toExponential(1)
+                  : "—"
+              }%`,
+              result.converged ? "on-chain matches your target" : "outside 0.5% tolerance",
               result.converged ? "#34d399" : "#fbbf24",
             )}
             {metric(
@@ -213,30 +225,30 @@ export default function DeployPayload({ config, onAdoptThreshold }: Props) {
               color: "#a5b4fc",
             }}
           >
-            <strong style={{ color: "#67e8f9" }}>Why this needed {result.rounds ?? 1} round(s): </strong>
-            CurveForge picks a graduation threshold and solves for the virtual liquidity that
-            reaches it. Meteora&apos;s SDK does the opposite — it derives liquidity from{" "}
-            <span className="mono">supply − vesting − leftover</span> and folds in a migration-fee
-            factor term (<span className="mono">w2 = Δ√p·(100−fee%)/pmax²</span>) our simulator
-            does not apply. One pass therefore lands somewhere else, and raising or lowering the
-            token supply will not help: the leftover absorbs the change, so a supply of{" "}
-            <span className="mono">10</span>, <span className="mono">9.2</span> or{" "}
-            <span className="mono">100</span> all yield the same SDK number. The server instead
-            iterates <span className="mono">T ← sdkThreshold(T)</span> until both derivations
-            agree — the converged figure is what the program would actually enforce.
+            <strong style={{ color: "#67e8f9" }}>
+              Why the curve input is larger than your target:{" "}
+            </strong>
+            CurveForge sizes the price ladder so a full traversal costs exactly{" "}
+            <span className="mono">{fmt(targetThreshold)}</span> {config.quote}. Meteora&apos;s SDK
+            re-derives the threshold from{" "}
+            <span className="mono">supply − vesting − leftover</span> plus its own fee and vesting
+            factors, and on this ladder it lands at{" "}
+            <span className="mono">{fmt(sdkFactorPct)}</span>% of the raw curve cost — so build the
+            curve to cost exactly <span className="mono">{fmt(targetThreshold)}</span> and the program
+            would graduate early, at <span className="mono">{fmt(naiveEnforcement)}</span>{" "}
+            {config.quote}.
+            <br />
+            Iterating <span className="mono">T ← sdkThreshold(T)</span> cannot repair that: the
+            relation is linear, so its only fixed point is <span className="mono">0</span> and the
+            sequence decays <span className="mono">T → c·T → c²·T → …</span> forever. The supply
+            cannot be nudged out of it either — <span className="mono">leftover = supply − sellable</span>{" "}
+            absorbs every change, so any supply yields the same factor. CurveForge instead inverts
+            the relation, <span className="mono">T ← target · T / sdkThreshold(T)</span>, which lands
+            in {result.rounds ?? 1} round(s) and leaves the program enforcing{" "}
+            <span className="mono">{fmt(result.sdkThreshold)}</span> {config.quote} — your number.
           </div>
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              className="chip"
-              data-on={converged}
-              style={{ borderRadius: 8, padding: "8px 16px" }}
-              disabled={!onAdoptThreshold}
-              onClick={() => onAdoptThreshold?.(result.simulatorThreshold)}
-            >
-              Apply converged threshold
-            </button>
             <button type="button" className="chip" onClick={copy}>
               {copied ? "Copied ✓" : "Copy ConfigParameters"}
             </button>

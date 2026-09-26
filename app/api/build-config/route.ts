@@ -32,16 +32,31 @@ export async function POST(request: Request) {
       );
     }
 
-    // CurveForge fixes the graduation threshold and solves for liquidity; the
-    // SDK fixes liquidity from `supply - vesting - leftover` and derives the
-    // threshold back. One pass therefore never lands on the same number.
+    // CurveForge sizes the curve so a full traversal costs exactly the
+    // graduation threshold we were asked for. Meteora's SDK re-derives the
+    // threshold from `supply - vesting - leftover` plus its own fee/vesting
+    // factors, and for a fixed price ladder that derivation is *linear* in the
+    // figure we pass: `sdkThreshold(T) = c * T` with `c` a constant set by the
+    // prices, weights and token decimals (measured 0.7634 on the default
+    // config, 0.7027 on Discovery, 0.7714 on RWA).
     //
-    // Iterating `T <- sdkThreshold(T)` reaches a fixed point where both
-    // derivations agree (typically 4-6 rounds). Verified: 750 -> 413.8087 ->
-    // 258.6304 -> 155.1783 -> 103.4522 -> 103.4522 (delta 1e-14).
-    const requestedThreshold = config.migrationQuoteThreshold;
-    const MAX_ROUNDS = 8;
+    // That makes the obvious iteration `T <- sdkThreshold(T)` useless: its only
+    // fixed point is 0. Left running it decays 750 -> 572 -> 437 -> 333 -> ...
+    // for ever and always reports "did not converge" — the supply cannot be
+    // nudged out of it either, because `leftover = baseSupply - sellable`
+    // absorbs the change and `c` never moves.
+    //
+    // The question a launcher actually has is different: "make the program
+    // enforce MY number". So we solve for that directly with the inverse step
+    //     T <- target * T / sdkThreshold(T)
+    // which lands in 1-2 rounds whenever the relation is linear (residual
+    // ~1e-7%) and in a handful more when integer `leftover` quantisation makes
+    // it slightly non-linear.
+    const targetThreshold = config.migrationQuoteThreshold;
+    const MAX_ROUNDS = 12;
     const TOLERANCE_PCT = 0.5;
+
+    const pctOff = (sdk: number) => ((sdk - targetThreshold) / targetThreshold) * 100;
 
     let cfg = config;
     let result = buildConfigParameters(cfg);
@@ -51,18 +66,28 @@ export async function POST(request: Request) {
       rounds < MAX_ROUNDS &&
       result.ok &&
       result.sdkThreshold !== null &&
-      result.thresholdDeltaPct !== null &&
-      Math.abs(result.thresholdDeltaPct) > TOLERANCE_PCT
+      Math.abs(pctOff(result.sdkThreshold)) > TOLERANCE_PCT
     ) {
-      cfg = { ...cfg, migrationQuoteThreshold: result.sdkThreshold };
+      const current = cfg.migrationQuoteThreshold;
+      const next = (targetThreshold * current) / result.sdkThreshold;
+      // A non-finite or non-positive step would make things worse; bail with
+      // whatever we have rather than loop on garbage.
+      if (!Number.isFinite(next) || next <= 0) break;
+      cfg = { ...cfg, migrationQuoteThreshold: next };
       result = buildConfigParameters(cfg);
       rounds += 1;
     }
 
+    // What the on-chain program will enforce, relative to what was requested.
+    // This — not `thresholdDeltaPct`, which stays the raw curve-vs-SDK gap and
+    // exists to explain *why* the scaling is needed — is the success metric.
+    const enforcementDeltaPct = result.sdkThreshold === null ? null : pctOff(result.sdkThreshold);
+
     return NextResponse.json({
       ...result,
-      requestedThreshold,
-      converged: result.thresholdDeltaPct !== null && Math.abs(result.thresholdDeltaPct) <= TOLERANCE_PCT,
+      requestedThreshold: targetThreshold,
+      enforcementDeltaPct,
+      converged: enforcementDeltaPct !== null && Math.abs(enforcementDeltaPct) <= TOLERANCE_PCT,
       rounds,
       issues,
     });

@@ -255,12 +255,7 @@ export default function Home() {
 
       {/* ---------- deploy ---------- */}
       <section style={{ marginTop: 34 }}>
-        <DeployPayload
-          config={config}
-          onAdoptThreshold={(t) =>
-            patch({ migrationQuoteThreshold: Number(t.toPrecision(12)) })
-          }
-        />
+        <DeployPayload config={config} />
       </section>
 
       <style jsx global>{`

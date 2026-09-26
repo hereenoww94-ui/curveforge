@@ -77,37 +77,48 @@ slider tilts any profile toward early or late.
 
 ---
 
-## Two thresholds, honestly reconciled
+## One threshold, enforced on-chain
 
-CurveForge and Meteora's SDK start from opposite ends, and the tool says so rather than papering
-over it.
+CurveForge and Meteora's SDK start from opposite ends of the same question, and the tool resolves
+it in the launcher's favour rather than papering over it.
 
 * **CurveForge** fixes the *migration quote threshold* (what a launch team picks — 750 USDC,
-  10 SOL, 1500 JUP…) and solves for the virtual liquidity that reaches it.
-* **Meteora's `buildCurveWithCustomSqrtPrices`** fixes liquidity from
-  `totalSupply − vesting − leftover` and derives the threshold from the resulting curve.
+  10 SOL, 1500 JUP…) and sizes the price ladder so a full traversal costs exactly that.
+* **Meteora's `buildCurveWithCustomSqrtPrices`** ignores that figure, recomputes the threshold from
+  `totalSupply − vesting − leftover` plus its own fee and vesting factors — and the program enforces
+  *its* number, not ours.
 
-The deploy payload panel reports the threshold you asked for, the fixed point both derivations
-agree on, the SDK's confirming value, and the round count needed to reach it.
+For a fixed price ladder the SDK's answer is **linear** in the figure we pass, `sdkThreshold(T) =
+c · T`, where `c` is set by the prices, weights and token decimals. Measured `c`: default ladder
+`0.7634`, Discovery `0.7027`, RWA `0.7714`, accumulation `0.8036`.
 
-The gap is not caused by supply. Meteora's derivation folds in a migration-fee factor term
-(`w2 = Δ√p · (100 − fee%) / pmax²`) that CurveForge's simulator does not apply, so one pass
-never matches — and changing `baseSupply` leaves the SDK's number unchanged, because `leftover`
-absorbs the difference. Verified empirically: supplying `10`, `9.2` or `100` all produce the same
-`sdkThreshold`.
+That linearity kills the obvious fix. Iterating `T ← sdkThreshold(T)` has exactly one fixed point,
+`0`, so it decays `750 → 572 → 437 → 333 → …` for ever and reports "did not converge" on every
+launch-team config. Nudging the supply does not help: `leftover = supply − sellable` absorbs the
+change and `c` never moves — verified, supplies of `10`, `9.2` and `100` all yield the same factor.
 
-So the API iterates `T ← sdkThreshold(T)` until both sides agree (tolerance 0.5%, cap 8 rounds).
-Measured on the tokenized-equity preset, threshold `750`:
+So the API asks the question a launcher actually has — *make the program enforce my number* — and
+solves it with the inverse step
 
 ```
-750 -> 413.8087 -> 258.6304 -> 155.1783 -> 103.4522 -> 103.4522   (delta 1.4e-14, 5 rounds)
+T ← target · T / sdkThreshold(T)
 ```
 
-**Apply converged threshold** writes the fixed point back into the studio, after which the
-simulator reflects the graduation cost the on-chain program would actually enforce. The panel
-also reports the initial supply the dynamic-supply model would mint (`sellable × 1.25`, the
-buffer documented on the launch-configuration page), which is a separate concern from
-reconciliation.
+Measured on the default ladder, target `750`:
+
+```
+T = 750.00    ->  program enforces 572.55          (graduates early)
+T = 982.43    ->  program enforces 750.000001      converged, 2 rounds, delta 1.3e-7 %
+```
+
+The deploy-payload panel reports the target, the solved curve input it had to feed the SDK, the
+value the program will now enforce, and the enforcement delta against your target. The raw
+curve-vs-SDK gap stays on screen as well — it is the reason the scaling exists, not a failure —
+along with the initial supply the dynamic-supply model would mint (`sellable × 1.25`, the buffer
+documented on the launch-configuration page).
+
+`scripts/trace-reconcile.ts` reproduces both the dead forward iteration and the working inverse
+across eight configurations.
 
 ---
 
